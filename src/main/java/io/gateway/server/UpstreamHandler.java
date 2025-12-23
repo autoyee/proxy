@@ -17,6 +17,8 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
 
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayDeque;
 import java.util.Deque;
 
@@ -33,6 +35,17 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
     }
 
     @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        InetSocketAddress remoteAddr = (InetSocketAddress) ctx.channel().remoteAddress();
+        String clientIP = remoteAddr.getAddress().getHostAddress();
+        int clientPort = remoteAddr.getPort();
+        log.info("Client connected {}:{}", clientIP, clientPort);
+
+        super.channelActive(ctx);
+    }
+
+
+    @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
         ctx.channel().attr(REQ_QUEUE).set(new ArrayDeque<>());
     }
@@ -44,14 +57,15 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
         try {
             // ========== 1. 请求头 ==========
             if (msg instanceof HttpRequest) {
-                HttpRequest req = (HttpRequest) msg;
-                log.info("Forwarding to downstream: {} {}", req.method(), req.uri());
-                EventLoop el = ctx.channel().eventLoop();
+                // 1.立刻创建 context 并入队
+                StreamRequestContext context = new StreamRequestContext();
+                queue.addLast(context);
 
+                HttpRequest req = (HttpRequest) msg;
+                EventLoop el = ctx.channel().eventLoop();
                 String host = "127.0.0.1";
                 int port = 8081;
-                String serviceKey = el + "|" + host + ":" + port;
-
+                String serviceKey = el.hashCode() + "|" + host + ":" + port;
                 log.info("Processing request: {} {} on event loop: {}", req.method(), req.uri(), el);
 
                 PerEventLoopChannelPoolManager poolManager = PerEventLoopChannelPoolManager.getInstance();
@@ -64,14 +78,21 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
                             }
 
                             Channel downstream = f.getNow();
-                            log.info("Successfully acquired downstream channel: {} for serviceKey: {}", downstream, serviceKey);
-
-                            StreamRelay relay = new StreamRelay(ctx.channel(), downstream, el, serviceKey);
-                            queue.addLast(new StreamRequestContext(relay));
-
                             HttpRequest downstreamReq = HttpCopier.copyRequest(req);
-                            log.info("Forwarded request to downstream: {}, URL: {} {}", downstream, downstreamReq.method(), downstreamReq.uri());
-                            downstream.writeAndFlush(downstreamReq);
+                            log.info("Successfully acquired downstream channel: {} for serviceKey: {}, URL: {} {} ",
+                                    downstream, serviceKey, downstreamReq.method(), downstreamReq.uri());
+                            downstream.writeAndFlush(downstreamReq)
+                                    .addListener(future -> {
+                                        if (future.isSuccess()) {
+                                            log.info("Forwarding HttpRequest to downstream success");
+                                        } else {
+                                            log.error("Failed to forward HttpRequest to downstream", future.cause());
+                                        }
+                                    });
+
+                            // 2.绑定 relay，并 flush pending body
+                            StreamRelay relay = new StreamRelay(ctx.channel(), downstream, el, serviceKey);
+                            context.bindRelay(relay);
                         });
 
                 return;
@@ -83,12 +104,9 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
 
                 StreamRequestContext current = queue.peekFirst();
                 if (current != null) {
-                    StreamRelay relay = current.getRelay();
-                    if (relay != null) {
-                        log.info("Forwarding content to relay, readable bytes: {}", content.content().readableBytes());
-                        relay.forwardUpstreamContent(content);
-                    }
+                    current.onContent(content);
 
+                    // 请求完成，移除队头
                     if (content instanceof LastHttpContent) {
                         queue.removeFirst();
                     }
@@ -107,7 +125,7 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
         log.info("Channel inactive: {}", ctx.channel());
         Deque<StreamRequestContext> queue = ctx.channel().attr(REQ_QUEUE).get();
         if (queue != null) {
-            queue.forEach(rc -> rc.getRelay().close());
+            queue.forEach(StreamRequestContext::close);
             queue.clear();
         }
     }
@@ -117,7 +135,7 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
         log.info("Exception in upstream handler for channel: {}", ctx.channel(), cause);
         Deque<StreamRequestContext> queue = ctx.channel().attr(REQ_QUEUE).get();
         if (queue != null) {
-            queue.forEach(rc -> rc.getRelay().close());
+            queue.forEach(StreamRequestContext::close);
             queue.clear();
         }
     }

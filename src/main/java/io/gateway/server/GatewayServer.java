@@ -40,7 +40,7 @@ public class GatewayServer {
                     @Override
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline().addLast(new HttpServerCodec())
-                                .addLast(new LoggingHandler(LogLevel.DEBUG))
+                                .addLast(new LoggingHandler(LogLevel.INFO))
 //                    .addLast(new HttpObjectAggregator(1024 * 1024))
                                 .addLast(new UpstreamHandler(plugins));
                     }

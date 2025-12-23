@@ -11,6 +11,6 @@ public class DownstreamInitializer extends ChannelInitializer<SocketChannel> {
 
     @Override
     protected void initChannel(SocketChannel ch) {
-        ch.pipeline().addLast(new HttpClientCodec());
+        ch.pipeline().addFirst("httpCodec", new HttpClientCodec());
     }
 }

@@ -7,6 +7,7 @@ import io.netty.channel.EventLoop;
 import io.netty.channel.pool.ChannelPoolHandler;
 import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.util.concurrent.Future;
 
 import java.util.Map;
@@ -42,6 +43,7 @@ public final class PerEventLoopChannelPoolManager {
 
                 @Override
                 public void channelCreated(Channel ch) {
+                    ensureBasePipeline(ch);
                 }
 
                 @Override
@@ -51,11 +53,20 @@ public final class PerEventLoopChannelPoolManager {
 
                 @Override
                 public void channelAcquired(Channel ch) throws Exception {
+                    ensureBasePipeline(ch);
                 }
             }, 10);
         });
 
         return pool.acquire();
+    }
+
+    private void ensureBasePipeline(Channel ch) {
+        ChannelPipeline p = ch.pipeline();
+
+        if (p.get("httpCodec") == null) {
+            p.addFirst("httpCodec", new HttpClientCodec());
+        }
     }
 
     public void release(EventLoop eventLoop, String serviceKey, Channel channel) {

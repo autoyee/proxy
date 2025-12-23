@@ -24,5 +24,6 @@ public final class HttpCopier {
         h.remove(HttpHeaderNames.CONNECTION);
         h.remove(HttpHeaderNames.TRANSFER_ENCODING);
         h.remove(HttpHeaderNames.CONTENT_LENGTH);
+        h.set(HttpHeaderNames.TRANSFER_ENCODING, HttpHeaderValues.CHUNKED);
     }
 }
