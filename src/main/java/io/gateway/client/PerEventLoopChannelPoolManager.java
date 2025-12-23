@@ -2,63 +2,71 @@ package io.gateway.client;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoop;
 import io.netty.channel.pool.ChannelPoolHandler;
 import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.concurrent.Future;
 
-import java.util.concurrent.CompletableFuture;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 /**
  * @author yee
  */
-public class PerEventLoopChannelPoolManager {
-    private final ConcurrentMap<String, FixedChannelPool> pools = new ConcurrentHashMap<>();
+public final class PerEventLoopChannelPoolManager {
 
-    public CompletableFuture<Channel> acquire(EventLoop el, String host, int port) {
-        String key = el + "|" + host + ":" + port;
-        FixedChannelPool pool = pools.computeIfAbsent(key, k -> createPool(el, host, port));
-        CompletableFuture<Channel> f = new CompletableFuture<>();
-        pool.acquire().addListener((Future<Channel> cf) -> {
-            if (cf.isSuccess()) {
-                f.complete(cf.getNow());
-            } else {
-                f.completeExceptionally(cf.cause());
-            }
-        });
-        return f;
+    private static final PerEventLoopChannelPoolManager INSTANCE = new PerEventLoopChannelPoolManager();
+
+    private final Map<EventLoop, Map<String, FixedChannelPool>> pools = new ConcurrentHashMap<>();
+
+    private PerEventLoopChannelPoolManager() {
     }
 
-    private FixedChannelPool createPool(EventLoop el, String host, int port) {
-        Bootstrap b = new Bootstrap();
-        b.group(el).channel(NioSocketChannel.class).remoteAddress(host, port)
-                .handler(new ChannelInitializer<Channel>() {
-                    @Override
-                    protected void initChannel(Channel ch) {
-                        ch.pipeline().addLast(new io.netty.handler.codec.http.HttpClientCodec());
-                    }
-                });
-        return new FixedChannelPool(b, new ChannelPoolHandler() {
-            @Override
-            public void channelReleased(Channel ch) throws Exception {
-                // 可留空或添加释放资源逻辑
-            }
+    public static PerEventLoopChannelPoolManager getInstance() {
+        return INSTANCE;
+    }
 
-            @Override
-            public void channelAcquired(Channel ch) throws Exception {
-                // 可留空或添加获取连接后的处理逻辑
-            }
+    public Future<Channel> acquire(EventLoop eventLoop, String host, int port, String serviceKey) {
+        Map<String, FixedChannelPool> perService = pools.computeIfAbsent(eventLoop, el -> new ConcurrentHashMap<>());
 
-            @Override
-            public void channelCreated(Channel ch) throws Exception {
-                // 初始化 channel 的逻辑可放在此处
-                ch.pipeline().addLast(new io.netty.handler.codec.http.HttpClientCodec());
-            }
-        }, 20);
+        FixedChannelPool pool = perService.computeIfAbsent(serviceKey, key -> {
+            Bootstrap bootstrap = new Bootstrap()
+                    .group(eventLoop)
+                    .channel(NioSocketChannel.class)
+                    .remoteAddress(host, port)
+                    .handler(new DownstreamInitializer());
 
+            return new FixedChannelPool(bootstrap, new ChannelPoolHandler() {
+
+                @Override
+                public void channelCreated(Channel ch) {
+                }
+
+                @Override
+                public void channelReleased(Channel ch) {
+                    cleanupPipeline(ch);
+                }
+
+                @Override
+                public void channelAcquired(Channel ch) throws Exception {
+                }
+            }, 10);
+        });
+
+        return pool.acquire();
+    }
+
+    public void release(EventLoop eventLoop, String serviceKey, Channel channel) {
+        FixedChannelPool pool = pools.get(eventLoop).get(serviceKey);
+        pool.release(channel);
+    }
+
+    private void cleanupPipeline(Channel ch) {
+        ChannelPipeline p = ch.pipeline();
+        if (p.get("relay") != null) {
+            p.remove("relay");
+        }
     }
 }
