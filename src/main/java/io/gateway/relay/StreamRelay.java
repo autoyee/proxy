@@ -47,7 +47,7 @@ public class StreamRelay {
         if (content instanceof LastHttpContent) {
             downstream.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
         }
-        ReferenceCountUtil.release(content);
+//        ReferenceCountUtil.release(content);
     }
 
     private void bindDownstream() {
@@ -62,9 +62,7 @@ public class StreamRelay {
                     if (msg instanceof HttpResponse) {
                         HttpResponse resp = (HttpResponse) msg;
                         upstream.writeAndFlush(HttpCopier.copyResponse(resp));
-                        return;
-                    }
-                    if (msg instanceof HttpContent) {
+                    } else if (msg instanceof HttpContent) {
                         HttpContent content = (HttpContent) msg;
                         ByteBuf buf = content.content();
                         if (buf.isReadable()) {
