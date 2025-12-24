@@ -4,11 +4,17 @@ import io.gateway.client.PerEventLoopChannelPoolManager;
 import io.gateway.util.HttpCopier;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
-import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.DefaultHttpContent;
+import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpResponse;
+import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.util.ReferenceCountUtil;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import static io.gateway.common.Constants.HTTP_CODEC;
+import static io.gateway.common.Constants.RELAY;
 
 /**
  * @author yee
@@ -66,12 +72,12 @@ public class StreamRelay {
     private void bindDownstream() {
         ChannelPipeline pipeline = downstream.pipeline();
 
-        if (pipeline.get("httpCodec") == null) {
+        if (pipeline.get(HTTP_CODEC) == null) {
             throw new IllegalStateException("HttpClientCodec missing in downstream pipeline");
         }
 
         // relay 必须在 codec 后面（inbound）
-        pipeline.addLast("relay", new ChannelInboundHandlerAdapter() {
+        pipeline.addLast(RELAY, new ChannelInboundHandlerAdapter() {
             @Override
             public void channelRead(ChannelHandlerContext ctx, Object msg) {
                 if (closed.get()) {
@@ -144,16 +150,27 @@ public class StreamRelay {
             return;
         }
 
-        log.info("Closing StreamRelay for serviceKey: {}, releasing downstream channel", serviceKey);
-        PerEventLoopChannelPoolManager.getInstance().release(eventLoop, serviceKey, downstream);
+        log.info("Closing StreamRelay for serviceKey: {}, releasing/closing downstream channel", serviceKey);
 
-        if (upstream.isActive()) {
+        // 先尝试释放到池（如果 pool 存在且 channel 健康），否则直接关闭 channel。
+        try {
+            if (downstream != null) {
+                if (downstream.isActive()) {
+                    PerEventLoopChannelPoolManager.getInstance().release(eventLoop, serviceKey, downstream);
+                } else {
+                    downstream.close();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to release downstream to pool, closing downstream: {}", e.getMessage());
+            if (downstream.isActive()) {
+                downstream.close();
+            }
+        }
+
+        if (upstream != null && upstream.isActive()) {
             log.info("Closing upstream channel: {}", upstream.id());
             upstream.close();
-        }
-        if (downstream.isActive()) {
-            log.info("Closing downstream channel: {}", downstream.id());
-            downstream.close();
         }
     }
 }

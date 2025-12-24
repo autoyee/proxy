@@ -1,6 +1,5 @@
 package io.gateway;
 
-import io.gateway.client.PerEventLoopChannelPoolManager;
 import io.gateway.plugin.PluginChainExecutor;
 import io.gateway.server.GatewayServer;
 
