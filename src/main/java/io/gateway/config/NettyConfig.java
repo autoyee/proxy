@@ -14,7 +14,7 @@ public final class NettyConfig {
     public static final int CONNECT_TIMEOUT_MILLIS = 3000;
 
     // Downstream 读超时（秒）
-    public static final int READ_TIMEOUT_SECONDS_CLIENT = 30;
+    public static final int READ_TIMEOUT_SECONDS_CLIENT = 60;
 
     // Upstream（server accepted connection）读超时（秒）
     public static final int READ_TIMEOUT_SECONDS_SERVER = 60;
@@ -23,8 +23,8 @@ public final class NettyConfig {
     public static final long ACQUIRE_TIMEOUT_MILLIS = 5000L;
 
     // FixedChannelPool max connections per serviceKey
-    public static final int POOL_MAX_CONNECTIONS = 10;
+    public static final int POOL_MAX_CONNECTIONS = 100;
 
     // FixedChannelPool 最大等待获取连接的请求数
-    public static final int POOL_MAX_PENDING_ACQUIRES = 50;
+    public static final int POOL_MAX_PENDING_ACQUIRES = 200;
 }

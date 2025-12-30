@@ -1,5 +1,8 @@
 package io.gateway.common;
 
+/**
+ * @author yee
+ */
 public class Constants {
 
     public static final String HTTP_CODEC = "httpCodec";

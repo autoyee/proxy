@@ -2,15 +2,14 @@ package io.gateway.client;
 
 import io.gateway.config.NettyConfig;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.ChannelPipeline;
-import io.netty.channel.EventLoop;
+import io.netty.channel.*;
 import io.netty.channel.pool.ChannelHealthChecker;
 import io.netty.channel.pool.ChannelPoolHandler;
 import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.timeout.ReadTimeoutHandler;
 import io.netty.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
 
@@ -18,19 +17,29 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import static io.gateway.common.Constants.HTTP_CODEC;
-import static io.gateway.common.Constants.RELAY;
+import static io.gateway.common.Constants.*;
 
 /**
+ *
+ * Production-grade per EventLoop channel pool manager.
+ * <p>
+ * 设计原则：
+ * 1. Pool 只负责 borrow / return 连接
+ * 2. Pool 不保存 Channel 引用
+ * 3. Pool 不感知请求是否成功
+ * 4. 是否 release 由上层 Relay 决定
+ *
  * @author yee
  */
 @Slf4j
-public class PerEventLoopChannelPoolManager {
+public class PerEventLoopChannelPoolManager implements DownstreamChannelPool {
 
     private static final PerEventLoopChannelPoolManager INSTANCE = new PerEventLoopChannelPoolManager();
 
-    // EventLoop -> (serviceKey -> PoolHolder)
-    private final Map<EventLoop, Map<String, PoolHolder>> POOLS = new ConcurrentHashMap<>();
+    /**
+     * EventLoop -> (PoolKey -> FixedChannelPool)
+     */
+    private final Map<EventLoop, Map<PoolKey, FixedChannelPool>> pools = new ConcurrentHashMap<>();
 
     private PerEventLoopChannelPoolManager() {
     }
@@ -39,53 +48,44 @@ public class PerEventLoopChannelPoolManager {
         return INSTANCE;
     }
 
-    public Future<Channel> acquire(EventLoop eventLoop, String host, int port, String serviceKey) {
-        Map<String, PoolHolder> perService = POOLS.computeIfAbsent(eventLoop, el -> new ConcurrentHashMap<>());
-
-        PoolHolder holder = perService.computeIfAbsent(serviceKey, key -> {
-            final PoolHolder ph = new PoolHolder();
-            ph.pool = createFixedChannelPool(eventLoop, host, port, ph);
-            return ph;
-        });
-
-        // 防御性检查，确保pool已设置
-        if (holder.pool == null) {
-            holder.pool = createFixedChannelPool(eventLoop, host, port, holder);
-        }
-
-        return holder.pool.acquire();
+    @Override
+    public Future<Channel> acquire(EventLoop eventLoop, PoolKey key) {
+        FixedChannelPool pool = getOrCreatePool(eventLoop, key);
+        return pool.acquire();
     }
 
-    /**
-     * 创建FixedChannelPool的私有方法，避免代码重复
-     */
-    private FixedChannelPool createFixedChannelPool(EventLoop eventLoop, String host, int port, PoolHolder holder) {
+    private FixedChannelPool getOrCreatePool(EventLoop eventLoop, PoolKey key) {
+        Map<PoolKey, FixedChannelPool> perEl = pools.computeIfAbsent(eventLoop, el -> new ConcurrentHashMap<>());
+
+        return perEl.computeIfAbsent(key, k -> createPool(eventLoop, k));
+    }
+
+    private FixedChannelPool createPool(EventLoop eventLoop, PoolKey key) {
         Bootstrap bootstrap = new Bootstrap()
                 .group(eventLoop)
                 .channel(NioSocketChannel.class)
-                .remoteAddress(host, port)
-                // 设置连接超时（毫秒）
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, NettyConfig.CONNECT_TIMEOUT_MILLIS)
-                .handler(new DownstreamInitializer());
+                .remoteAddress(key.host(), key.port())
+                .option(ChannelOption.TCP_NODELAY, true)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, NettyConfig.CONNECT_TIMEOUT_MILLIS);
 
-        // 使用健康检查、acquire 超时策略，和 maxConnections
         return new FixedChannelPool(
                 bootstrap,
                 new ChannelPoolHandler() {
                     @Override
                     public void channelCreated(Channel ch) {
-                        ensureBasePipeline(ch);
-                        holder.channels.add(ch);
-                    }
-
-                    @Override
-                    public void channelReleased(Channel ch) {
-                        cleanupPipeline(ch);
+                        ch.pipeline().addFirst(HTTP_CODEC, new HttpClientCodec());
+                        // 读超时：如果在一定时间内没有从下游读取到数据，会抛出 ReadTimeoutException
+                        ch.pipeline().addLast(READ_TIMEOUT, new ReadTimeoutHandler(NettyConfig.READ_TIMEOUT_SECONDS_CLIENT));
                     }
 
                     @Override
                     public void channelAcquired(Channel ch) {
-                        ensureBasePipeline(ch);
+                        // no-op
+                    }
+
+                    @Override
+                    public void channelReleased(Channel ch) {
+                        // no-op
                     }
                 },
                 ChannelHealthChecker.ACTIVE,
@@ -96,86 +96,69 @@ public class PerEventLoopChannelPoolManager {
         );
     }
 
-    private void ensureBasePipeline(Channel ch) {
-        ChannelPipeline p = ch.pipeline();
+    @Override
+    public void release(EventLoop eventLoop, PoolKey key, Channel channel) {
+        if (eventLoop == null || key == null || channel == null) {
+            destroy(channel);
+            return;
+        }
 
-        if (p.get(HTTP_CODEC) == null) {
-            p.addFirst(HTTP_CODEC, new HttpClientCodec());
+        if (!channel.isActive()) {
+            destroy(channel);
+            return;
         }
-    }
 
-    public void release(EventLoop eventLoop, String serviceKey, Channel channel) {
-        if (eventLoop == null || serviceKey == null || channel == null) {
-            if (channel != null && channel.isActive()) {
-                channel.close();
-            }
+        FixedChannelPool pool = getPool(eventLoop, key);
+        if (pool == null) {
+            destroy(channel);
             return;
         }
-        Map<String, PoolHolder> perService = POOLS.get(eventLoop);
-        if (perService == null) {
-            // no pool for this event loop: close channel to be safe
-            if (channel.isActive()) channel.close();
-            return;
-        }
-        PoolHolder holder = perService.get(serviceKey);
-        if (holder == null || holder.pool == null) {
-            if (channel.isActive()) channel.close();
-            return;
-        }
+
         try {
-            holder.pool.release(channel);
+            pool.release(channel);
         } catch (Exception e) {
-            log.warn("Failed to release channel to pool for serviceKey {}, closing channel: {}", serviceKey, e.getMessage());
-            if (channel.isActive()) channel.close();
+            log.warn("Failed to release channel to pool {}, closing channel", key, e);
+            destroy(channel);
         }
     }
 
-    private void cleanupPipeline(Channel ch) {
-        ChannelPipeline p = ch.pipeline();
-        if (p.get(RELAY) != null) {
-            p.remove(RELAY);
-        }
+    private FixedChannelPool getPool(EventLoop eventLoop, PoolKey key) {
+        Map<PoolKey, FixedChannelPool> perEl = pools.get(eventLoop);
+        return perEl != null ? perEl.get(key) : null;
+    }
+
+    /**
+     * 异常场景调用，永不复用
+     */
+    @Override
+    public void destroy(EventLoop eventLoop, PoolKey key, Channel channel) {
+        destroy(channel);
     }
 
     /**
      * 关闭并释放所有池里的 channel。用于优雅关闭。
      */
     public void shutdown() {
-        log.info("Shutting down PerEventLoopChannelPoolManager, closing pooled channels.");
-        for (Map.Entry<EventLoop, Map<String, PoolHolder>> entry : POOLS.entrySet()) {
-            Map<String, PoolHolder> perService = entry.getValue();
-            if (perService == null) continue;
-            for (Map.Entry<String, PoolHolder> holderEntry : perService.entrySet()) {
-                PoolHolder holder = holderEntry.getValue();
-                if (holder == null) continue;
-                for (Channel ch : holder.channels) {
-                    try {
-                        if (ch != null && ch.isActive()) {
-                            ch.close().sync();
-                        }
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    } catch (Exception ex) {
-                        log.warn("Error closing pooled channel: {}", ex.getMessage());
-                    }
+        log.info("Shutting down ChannelPoolManager");
+
+        for (Map<PoolKey, FixedChannelPool> perEl : pools.values()) {
+            for (FixedChannelPool pool : perEl.values()) {
+                try {
+                    pool.close();
+                } catch (Throwable ignore) {
                 }
-                holder.channels.clear();
             }
-            perService.clear();
+            perEl.clear();
         }
-        POOLS.clear();
-        log.info("PerEventLoopChannelPoolManager shutdown complete.");
+        pools.clear();
+        log.info("ChannelPoolManager shutdown complete");
     }
 
-    private static final class PoolHolder {
-        volatile FixedChannelPool pool;
-        final Set<Channel> channels = ConcurrentHashMap.newKeySet();
-
-        PoolHolder() {
-        }
-
-        PoolHolder(FixedChannelPool pool) {
-            this.pool = pool;
+    private void destroy(Channel channel) {
+        if (channel == null) return;
+        try {
+            channel.close();
+        } catch (Throwable ignore) {
         }
     }
 }

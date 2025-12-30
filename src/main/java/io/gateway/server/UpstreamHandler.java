@@ -1,6 +1,7 @@
 package io.gateway.server;
 
 import io.gateway.client.PerEventLoopChannelPoolManager;
+import io.gateway.client.PoolKey;
 import io.gateway.plugin.PluginChainExecutor;
 import io.gateway.relay.StreamRelay;
 import io.gateway.relay.StreamRequestContext;
@@ -13,7 +14,6 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.Future;
 import lombok.extern.slf4j.Slf4j;
 
-import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -26,6 +26,8 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
 
     private final PluginChainExecutor plugins;
     private static final AttributeKey<Deque<StreamRequestContext>> REQ_QUEUE = AttributeKey.valueOf("req_queue");
+    private static final int MAX_PENDING_CHUNKS = 1024;
+
     private static final String UPSTREAM_HOST = "127.0.0.1";
     private static final int UPSTREAM_PORT = 8081;
 
@@ -33,11 +35,13 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
         this.plugins = plugins;
     }
 
+    /* ================= lifecycle ================= */
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
         ctx.channel().attr(REQ_QUEUE).set(new ArrayDeque<>());
     }
 
+    /* ================= channelRead ================= */
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
         Deque<StreamRequestContext> queue = ctx.channel().attr(REQ_QUEUE).get();
@@ -56,57 +60,91 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
+    /* ================= handlers ================= */
     private void handleHttpRequest(ChannelHandlerContext ctx, HttpRequest req, Deque<StreamRequestContext> queue) {
-        // 1. 创建上下文并入队
-        StreamRequestContext context = new StreamRequestContext();
+        // 创建上下文并入队
+        StreamRequestContext context = new StreamRequestContext(MAX_PENDING_CHUNKS);
         queue.addLast(context);
 
-        EventLoop el = ctx.channel().eventLoop();
+        EventLoop eventLoop = ctx.channel().eventLoop();
         String serviceKey = UPSTREAM_HOST + ":" + UPSTREAM_PORT;
-        log.info("Processing request: {} {} on event loop: {}", req.method(), req.uri(), el);
+        log.info("Processing request: {} {} on event loop: {}", req.method(), req.uri(), eventLoop);
+        PoolKey poolKey = new PoolKey(serviceKey, UPSTREAM_HOST, UPSTREAM_PORT, "HTTP");
 
-        // 2. 异步获取连接
+        // 异步获取连接
+        acquireAndWriteDownstream(ctx, req, context, eventLoop, poolKey);
+    }
+
+    private void acquireAndWriteDownstream(ChannelHandlerContext upstreamCtx, HttpRequest upstreamReq,
+                                           StreamRequestContext context, EventLoop eventLoop, PoolKey poolKey) {
         PerEventLoopChannelPoolManager.getInstance()
-                .acquire(el, UPSTREAM_HOST, UPSTREAM_PORT, serviceKey)
+                .acquire(eventLoop, poolKey)
                 .addListener((Future<Channel> f) -> {
                     if (!f.isSuccess()) {
-                        log.error("Failed to acquire downstream channel for serviceKey: {}", serviceKey, f.cause());
-                        // 失败时清理 Context（释放 pending body）并返回 502
+                        // acquire 失败
                         context.close();
-                        queue.remove(context);
-                        safeWriteError(ctx, HttpResponseStatus.BAD_GATEWAY, "Backend unavailable");
+                        writeUpstreamError(upstreamCtx, HttpResponseStatus.BAD_GATEWAY, "Backend unavailable");
                         return;
                     }
 
                     Channel downstream = f.getNow();
-                    // 传入 clientChannel 以增强 Header
-                    HttpRequest downstreamReq = HttpCopier.copyRequest(req, ctx.channel());
-                    log.info("Successfully acquired downstream channel: {} for serviceKey: {}, URL: {} {} ",
-                            downstream, serviceKey, downstreamReq.method(), downstreamReq.uri());
+                    // 一切 downstream 操作，必须切回 downstream EventLoop
+                    downstream.eventLoop().execute(() -> {
+                        // 1. channel 必须 active
+                        if (!downstream.isActive()) {
+                            destroyDownstream(poolKey, downstream);
+                            context.close();
+                            writeUpstreamError(upstreamCtx, HttpResponseStatus.BAD_GATEWAY, "Downstream inactive");
+                            return;
+                        }
 
-                    downstream.writeAndFlush(downstreamReq)
-                            .addListener(writeFuture -> {
-                                if (writeFuture.isSuccess()) {
-                                    log.info("Forwarding httpRequest to downstream success");
-                                } else {
-                                    log.error("Failed to forward httpRequest to downstream", writeFuture.cause());
-                                    // 写失败处理
-                                    context.close();
-                                    safeWriteError(ctx, HttpResponseStatus.BAD_GATEWAY, "Failed to send request");
-                                }
-                            });
+                        HttpRequest downstreamReq = HttpCopier.copyRequest(upstreamReq, upstreamCtx.channel());
+                        // 2. 真正写请求
+                        downstream.writeAndFlush(downstreamReq)
+                                .addListener(wf -> {
+                                    if (!wf.isSuccess()) {
+                                        // write 失败，永不复用
+                                        context.close();
+                                        destroyDownstream(poolKey, downstream);
+                                        writeUpstreamError(upstreamCtx, HttpResponseStatus.BAD_GATEWAY, "Failed to forward request");
+                                    } else {
+                                        // 只有这里才算“下游 ready”
+                                        context.markRequestSent();
+                                    }
+                                });
 
-                    // 3. 绑定 Relay
-                    StreamRelay relay = new StreamRelay(ctx.channel(), downstream, el, serviceKey);
-                    context.bindRelay(relay);
+                        // 3. 构建 relay
+                        StreamRelay relay = new StreamRelay(upstreamCtx.channel(), downstream, eventLoop, poolKey);
+                        context.bindRelay(relay);
+                    });
                 });
+    }
+
+    private void destroyDownstream(PoolKey key, Channel ch) {
+        try {
+            PerEventLoopChannelPoolManager.getInstance().destroy(ch.eventLoop(), key, ch);
+        } catch (Exception ignore) {
+        }
+    }
+
+    private void writeUpstreamError(ChannelHandlerContext ctx, HttpResponseStatus status, String msg) {
+        if (!ctx.channel().isActive()) return;
+
+        FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, Unpooled.copiedBuffer(msg, StandardCharsets.UTF_8));
+        resp.headers().set(HttpHeaderNames.CONTENT_LENGTH, resp.content().readableBytes());
+
+        ctx.writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
     }
 
     private void handleHttpContent(ChannelHandlerContext ctx, HttpContent content, Deque<StreamRequestContext> queue) {
         StreamRequestContext current = queue.peekFirst();
         if (current != null) {
-            current.onContent(content);
-            if (content instanceof LastHttpContent) {
+            // HttpContent 到达
+            boolean accepted = current.onContent(content);
+            if (!accepted) {
+                ReferenceCountUtil.release(content);
+                writeUpstreamError(ctx, HttpResponseStatus.SERVICE_UNAVAILABLE, "Too many pending chunks");
+            } else if (content instanceof LastHttpContent) {
                 queue.removeFirst();
             }
         } else {
@@ -116,24 +154,11 @@ public class UpstreamHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    // 统一错误响应方法
-    private void safeWriteError(ChannelHandlerContext ctx, HttpResponseStatus status, String msg) {
-        if (ctx.channel().isActive()) {
-            FullHttpResponse resp = new DefaultFullHttpResponse(
-                    HttpVersion.HTTP_1_1, status,
-                    Unpooled.copiedBuffer(msg, StandardCharsets.UTF_8)
-            );
-            resp.headers().set(HttpHeaderNames.CONTENT_TYPE, "text/plain; charset=UTF-8");
-            resp.headers().set(HttpHeaderNames.CONTENT_LENGTH, resp.content().readableBytes());
-            ctx.writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
-        }
-    }
-
+    /* ================= error handling ================= */
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         log.info("Channel inactive: {}", ctx.channel());
         cleanupQueue(ctx);
-        super.channelInactive(ctx);
     }
 
     @Override

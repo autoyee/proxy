@@ -1,21 +1,19 @@
 package io.gateway.relay;
 
 import io.gateway.client.PerEventLoopChannelPoolManager;
+import io.gateway.client.PoolKey;
 import io.gateway.util.HttpCopier;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
-import io.netty.channel.*;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.EventLoop;
 import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.util.ReferenceCountUtil;
 import lombok.extern.slf4j.Slf4j;
-
-import java.util.concurrent.atomic.AtomicBoolean;
-
-import static io.gateway.common.Constants.HTTP_CODEC;
-import static io.gateway.common.Constants.RELAY;
 
 /**
  * @author yee
@@ -26,75 +24,70 @@ public class StreamRelay {
     private final Channel upstream;
     private final Channel downstream;
     private final EventLoop eventLoop;
-    private final String serviceKey;
-    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final PoolKey poolKey;
+    private volatile RelayState state = RelayState.INIT;
 
-    // 标记本次 HTTP 交互是否完整成功
-    private volatile boolean exchangeComplete = false;
-
-    public StreamRelay(Channel upstream, Channel downstream, EventLoop eventLoop, String serviceKey) {
+    public StreamRelay(Channel upstream, Channel downstream, EventLoop eventLoop, PoolKey poolKey) {
         this.upstream = upstream;
         this.downstream = downstream;
         this.eventLoop = eventLoop;
-        this.serviceKey = serviceKey;
+        this.poolKey = poolKey;
+
         bindDownstream();
     }
 
-    public void forwardUpstreamContent(HttpContent content) {
-        if (closed.get()) {
-            log.info("StreamRelay is closed, releasing content");
+    /* ==================== upstream -> downstream ==================== */
+    public void forwardRequest(HttpContent content) {
+        if (state != RelayState.INIT && state != RelayState.STREAMING) {
             ReferenceCountUtil.release(content);
             return;
         }
 
-        ByteBuf buf = content.content();
-        if (buf.isReadable()) {
-            log.info("Forwarding httpContent to downstream, readable bytes: {}", buf.readableBytes());
-            DefaultHttpContent msg = new DefaultHttpContent(buf.retainedDuplicate());
-            downstream.write(msg)
-                    .addListener(future -> {
-                        if (future.isSuccess()) {
-                            log.info("Forwarding httpContent to downstream write success");
-                        } else {
-                            // 写失败直接关闭
-                            close();
-                            log.error("Failed to write httpContent to downstream", future.cause());
-                        }
-                    });
-        }
+        state = RelayState.STREAMING;
+        downstream.eventLoop().execute(() -> {
+            ByteBuf buf = content.content();
+            if (buf.isReadable()) {
+                log.debug("Forwarding httpContent to downstream, readable bytes: {}", buf.readableBytes());
+                DefaultHttpContent msg = new DefaultHttpContent(buf.retainedDuplicate());
+                downstream.write(msg)
+                        .addListener(future -> {
+                            if (future.isSuccess()) {
+                                log.debug("Forwarding httpContent to downstream write success");
+                            } else {
+                                fail(future.cause());
+                                log.error("Failed to write httpContent to downstream", future.cause());
+                            }
+                        });
+            }
 
-        if (content instanceof LastHttpContent) {
-            log.info("Forwarding lastHttpContent to downstream");
-            downstream.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT)
-                    .addListener(future -> {
-                        if (future.isSuccess()) {
-                            log.info("Forwarding lastHttpContent to downstream success");
-                        } else {
-                            close();
-                            log.error("Failed to write lastHttpContent to downstream", future.cause());
-                        }
-                    });
-        }
+            if (content instanceof LastHttpContent) {
+                log.info("Forwarding lastHttpContent to downstream");
+                downstream.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT)
+                        .addListener(future -> {
+                            if (future.isSuccess()) {
+                                log.info("Forwarding lastHttpContent to downstream success");
+                            } else {
+                                fail(future.cause());
+                                log.error("Failed to write lastHttpContent to downstream", future.cause());
+                            }
+                        });
+            }
+
+            ReferenceCountUtil.release(content);
+        });
     }
 
+    /* ==================== downstream -> upstream ==================== */
     private void bindDownstream() {
-        ChannelPipeline pipeline = downstream.pipeline();
-        if (pipeline.get(HTTP_CODEC) == null) {
-            // 防御性关闭
-            close();
-            throw new IllegalStateException("HttpClientCodec missing in downstream pipeline");
-        }
-
-        pipeline.addLast(RELAY, new ChannelInboundHandlerAdapter() {
+        downstream.pipeline().addLast(new ChannelInboundHandlerAdapter() {
             @Override
             public void channelRead(ChannelHandlerContext ctx, Object msg) {
-                if (closed.get()) {
-                    log.info("StreamRelay is closed, releasing message from downstream");
-                    ReferenceCountUtil.release(msg);
-                    return;
-                }
-
                 try {
+                    if (state == RelayState.FAILED || state == RelayState.CLOSED) {
+                        ReferenceCountUtil.release(msg);
+                        return;
+                    }
+
                     if (msg instanceof HttpResponse) {
                         HttpResponse resp = (HttpResponse) msg;
                         log.info("Received httpResponse from downstream, status: {}", resp.status());
@@ -104,7 +97,7 @@ public class StreamRelay {
                                     if (future.isSuccess()) {
                                         log.info("Successfully forwarded httpResponse to upstream");
                                     } else {
-                                        close();
+                                        fail(future.cause());
                                         log.error("Failed to write httpResponse to upstream", future.cause());
                                     }
                                 });
@@ -113,12 +106,13 @@ public class StreamRelay {
                         ByteBuf buf = content.content();
 
                         if (buf.isReadable()) {
-                            log.info("Received httpContent from downstream, readable bytes: {}", buf.readableBytes());
+                            log.debug("Received httpContent from downstream, readable bytes: {}", buf.readableBytes());
                             upstream.write(new DefaultHttpContent(buf.retainedDuplicate()))
                                     .addListener(future -> {
                                         if (future.isSuccess()) {
-                                            log.info("Successfully forwarded httpContent to upstream");
+                                            log.debug("Successfully forwarded httpContent to upstream");
                                         } else {
+                                            fail(future.cause());
                                             log.error("Failed to forward httpContent to upstream", future.cause());
                                         }
                                     });
@@ -126,74 +120,76 @@ public class StreamRelay {
 
                         if (content instanceof LastHttpContent) {
                             log.info("Received lastHttpContent from downstream");
-                            // 收到 LastHttpContent，且无异常，标记为交换完成
-                            exchangeComplete = true;
+                            state = RelayState.COMPLETED;
                             upstream.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT)
                                     .addListener(future -> {
                                         if (future.isSuccess()) {
                                             log.info("Successfully forwarded lastHttpContent to upstream");
                                             // 交互完美结束，清理 Handler 并归还连接池
                                             ctx.pipeline().remove(this);
-                                            releaseDownstream();
+                                            release();
                                         } else {
-                                            close();
+                                            fail(future.cause());
                                             log.error("Failed to forward lastHttpContent to upstream", future.cause());
                                         }
                                     });
                         }
                     }
                 } catch (Exception e) {
-                    log.error("Exception processing message from downstream for serviceKey: {}", serviceKey, e);
-                    close();
+                    log.error("Exception processing message from downstream for serviceKey: {}", poolKey.scheme(), e);
+                    fail(e);
                 } finally {
                     ReferenceCountUtil.release(msg);
                 }
             }
 
             @Override
-            public void channelInactive(ChannelHandlerContext ctx) {
-                log.info("Downstream channel inactive, closing streamRelay for serviceKey: {}", serviceKey);
-                // 如果连接断开时交互未完成，说明是异常断开
-                if (!exchangeComplete) {
-                    close();
-                }
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+                fail(cause);
             }
 
             @Override
-            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-                log.error("Exception in downstream handler for serviceKey: {}, cause: {}", serviceKey, cause.getMessage());
-                close();
+            public void channelInactive(ChannelHandlerContext ctx) {
+                if (state != RelayState.COMPLETED) {
+                    fail(null);
+                }
             }
         });
     }
 
-    /**
-     * 正常归还连接
-     */
-    private void releaseDownstream() {
-        if (closed.compareAndSet(false, true)) {
-            PerEventLoopChannelPoolManager.getInstance().release(eventLoop, serviceKey, downstream);
+    /* ==================== lifecycle ==================== */
+    private void release() {
+        if (state != RelayState.COMPLETED) return;
+        state = RelayState.CLOSED;
+        PerEventLoopChannelPoolManager.getInstance().release(eventLoop, poolKey, downstream);
+    }
+
+    private void fail(Throwable t) {
+        if (state == RelayState.CLOSED) return;
+        state = RelayState.FAILED;
+
+        downstream.close();
+        if (upstream.isActive()) {
+            upstream.close();
         }
     }
 
     /**
-     * 异常关闭（销毁连接）
+     * 主动关闭（上游取消 / context 清理 / server shutdown）
+     * 语义：等同于失败路径，永不归还连接池
      */
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        log.info("Force closing relay for {}", serviceKey);
+        if (state == RelayState.CLOSED) return;
+        state = RelayState.CLOSED;
 
-        // 只有 exchangeComplete 为 true 时才归还池，否则直接 close downstream
-        // 这里因为是异常调用 close()，说明状态肯定不好，直接 destroy
-        if (downstream != null) {
-            // 这里的 close 会触发 FixedChannelPool 的清理逻辑
-            downstream.close();
-        }
-
-        if (upstream != null && upstream.isActive()) {
-            upstream.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(ChannelFutureListener.CLOSE);
+        try {
+            if (downstream != null) {
+                downstream.close();
+            }
+        } finally {
+            if (upstream != null && upstream.isActive()) {
+                upstream.close();
+            }
         }
     }
 }

@@ -44,7 +44,7 @@ public class GatewayServer {
                     protected void initChannel(SocketChannel ch) {
                         ch.pipeline().addLast(new HttpServerCodec())
                                 // 服务端读超时：若在一定时间内没有从客户端读取数据，可触发并处理
-                                .addLast(new ReadTimeoutHandler(NettyConfig.READ_TIMEOUT_SECONDS_SERVER))
+//                                .addLast(new ReadTimeoutHandler(NettyConfig.READ_TIMEOUT_SECONDS_SERVER))
                                 .addLast(new UpstreamHandler(plugins));
                     }
                 });
@@ -56,7 +56,6 @@ public class GatewayServer {
             throw e;
         }
     }
-
 
     public void close() {
         try {
